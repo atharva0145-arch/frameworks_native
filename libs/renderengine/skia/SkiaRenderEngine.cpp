@@ -738,8 +738,14 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
         }
     }
 
+#ifdef TARGET_SUPPORTS_DOLBY_VISION
+    const bool usedDolby = parameters.dolbyApplied;
+#else
+    constexpr bool usedDolby = false;
+#endif
+
     bool usedAgtm = false;
-    if (graphicBuffer) {
+    if (graphicBuffer && !usedDolby) {
         if (parameters.layer.luts) {
             shader = mLutShader.lutShader(shader, parameters.layer.luts,
                                           parameters.layer.sourceDataspace);
@@ -756,7 +762,9 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
         }
     }
 
-    if (parameters.requiresLinearEffect) {
+    if (parameters.requiresLinearEffect &&
+        (!usedDolby || parameters.layer.colorTransform != mat4() ||
+         parameters.fakeOutputDataspace != ui::Dataspace::UNKNOWN)) {
         const auto format = targetBuffer != nullptr
                 ? std::optional<ui::PixelFormat>(
                           static_cast<ui::PixelFormat>(targetBuffer->getPixelFormat()))
@@ -765,7 +773,7 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
         const auto hdrType = getHdrRenderType(parameters.layer.sourceDataspace, format,
                                               parameters.layerDimmingRatio);
 
-        const auto usingLocalTonemap =
+        const auto usingLocalTonemap = !usedDolby &&
                 parameters.display.tonemapStrategy == DisplaySettings::TonemapStrategy::Local &&
                 hdrType != HdrRenderType::SDR &&
                 shader->isAImage((SkMatrix*)nullptr, (SkTileMode*)nullptr) &&
@@ -781,7 +789,7 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
         // skip tonemapping if the luts is in use
         // or if we used AGTM
         auto inputDataspace =
-                usingLocalTonemap || (graphicBuffer && parameters.layer.luts) || usedAgtm
+                usedDolby || usingLocalTonemap || (graphicBuffer && parameters.layer.luts) || usedAgtm
                 ? parameters.outputDataSpace
                 : parameters.layer.sourceDataspace;
         auto effect =
@@ -795,7 +803,7 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
 
         mat4 colorTransform = parameters.layer.colorTransform;
 
-        if (!usingLocalTonemap) {
+        if (!usingLocalTonemap && !usedDolby) {
             colorTransform *=
                     mat4::scale(vec4(parameters.layerDimmingRatio, parameters.layerDimmingRatio,
                                      parameters.layerDimmingRatio, 1.f));
@@ -1670,8 +1678,35 @@ void SkiaRenderEngine::drawLayersInternal(
             matrix.postTranslate(bounds.rect().fLeft, bounds.rect().fTop);
 
             sk_sp<SkShader> shader;
-
-            if (layer.source.buffer.useTextureFiltering) {
+#ifdef TARGET_SUPPORTS_DOLBY_VISION
+            // Dolby's IPT and LUT values must reach the Dolby shader without
+            // Skia's ordinary color-space conversion. The effect itself converts
+            // to the output dataspace and applies the layer's dimming ratio.
+            bool dolbyApplied = false;
+            if (mDolbyVisionShader.prepare(*item.buffer->getBuffer(), layerDataspace)) {
+                auto rawShader = image->makeRawShader(
+                        SkTileMode::kClamp, SkTileMode::kClamp,
+                        SkSamplingOptions(item.useTextureFiltering ? SkFilterMode::kLinear
+                                                                    : SkFilterMode::kNearest),
+                        &matrix);
+                shader = mDolbyVisionShader.makeShader(std::move(rawShader), display.outputDataspace,
+                                                       dimInLinearSpace ? layerDimmingRatio : 1.f);
+                dolbyApplied = shader != nullptr;
+            }
+            // If the optional effect cannot run, restore the ordinary image
+            // shader, including its color management and alpha handling.
+            if (!shader) {
+                if (item.useTextureFiltering) {
+                    shader = image->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
+                                               SkSamplingOptions(
+                                                       {SkFilterMode::kLinear, SkMipmapMode::kNone}),
+                                               &matrix);
+                } else {
+                    shader = image->makeShader(SkSamplingOptions(), matrix);
+                }
+            }
+#else
+            if (item.useTextureFiltering) {
                 shader = image->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
                                            SkSamplingOptions(
                                                    {SkFilterMode::kLinear, SkMipmapMode::kNone}),
@@ -1679,6 +1714,7 @@ void SkiaRenderEngine::drawLayersInternal(
             } else {
                 shader = image->makeShader(SkSamplingOptions(), matrix);
             }
+#endif
 
             if (useIsOpaqueWorkaround) {
                 shader = SkShaders::Blend(SkBlendMode::kPlus, shader,
@@ -1702,6 +1738,9 @@ void SkiaRenderEngine::drawLayersInternal(
                     .imageBounds = imageBounds,
                     .agtm = agtm,
                     .colorSpaceOptions = colorSpaceOptions,
+#ifdef TARGET_SUPPORTS_DOLBY_VISION
+                    .dolbyApplied = dolbyApplied,
+#endif
             }));
 
             // Turn on dithering when dimming beyond this (arbitrary) threshold...
